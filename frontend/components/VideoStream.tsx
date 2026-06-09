@@ -3,9 +3,10 @@ import React, { useState, useRef, useEffect } from 'react';
 interface VideoStreamProps {
   isActive: boolean;
   onError?: (error: string) => void;
+  onStreamReady?: (stream: MediaStream) => void;
 }
 
-export const VideoStream: React.FC<VideoStreamProps> = ({ isActive, onError }) => {
+export const VideoStream: React.FC<VideoStreamProps> = ({ isActive, onError, onStreamReady }) => {
   const videoRef = useRef<HTMLVideoElement>(null);
   const [permission, setPermission] = useState(false);
 
@@ -26,6 +27,7 @@ export const VideoStream: React.FC<VideoStreamProps> = ({ isActive, onError }) =
         if (videoRef.current) {
           videoRef.current.srcObject = stream;
           setPermission(true);
+          onStreamReady?.(stream);
         }
       } catch (error) {
         const errorMsg = error instanceof Error ? error.message : 'Camera/microphone access denied';

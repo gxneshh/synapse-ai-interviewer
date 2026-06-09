@@ -149,6 +149,15 @@ async def websocket_endpoint(websocket: WebSocket):
         }
         await websocket.send_json(opening_message)
 
+        # Send the opening audio bytes if available
+        if getattr(orchestrator, "opening_audio", None):
+            import base64
+            audio_b64 = base64.b64encode(orchestrator.opening_audio).decode("utf-8")
+            await websocket.send_json({
+                "type": "audio",
+                "audio": audio_b64
+            })
+
         # Main streaming loop
         while orchestrator.is_running:
             try:
@@ -167,6 +176,20 @@ async def websocket_endpoint(websocket: WebSocket):
                 }
 
                 await websocket.send_json(response)
+
+                # Send interruption signal if detected
+                if result.get("interrupted"):
+                    await websocket.send_json({"type": "interruption"})
+
+                # Send response audio if generated
+                ai_audio = result.get("ai_response")
+                if ai_audio:
+                    import base64
+                    audio_b64 = base64.b64encode(ai_audio).decode("utf-8")
+                    await websocket.send_json({
+                        "type": "audio",
+                        "audio": audio_b64
+                    })
 
             except asyncio.TimeoutError:
                 # Send keep-alive message

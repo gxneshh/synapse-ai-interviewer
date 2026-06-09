@@ -14,6 +14,78 @@ export default function Interview() {
   const [error, setError] = useState<string | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
+  const mediaStreamRef = useRef<MediaStream | null>(null);
+  const processorNodeRef = useRef<ScriptProcessorNode | null>(null);
+  const audioInputRef = useRef<MediaStreamAudioSourceNode | null>(null);
+  const currentAudioSourceRef = useRef<AudioBufferSourceNode | null>(null);
+
+  const startAudioStreaming = (stream: MediaStream) => {
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    if (processorNodeRef.current) return; // Already streaming
+
+    try {
+      if (!audioContextRef.current) {
+        audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
+      }
+      const ctx = audioContextRef.current;
+      if (ctx.state === 'suspended') {
+        ctx.resume();
+      }
+
+      // Create audio source from the microphone stream
+      const source = ctx.createMediaStreamSource(stream);
+      audioInputRef.current = source;
+
+      // Create ScriptProcessorNode to downsample/process raw PCM
+      const processor = ctx.createScriptProcessor(4096, 1, 1);
+      processorNodeRef.current = processor;
+
+      processor.onaudioprocess = (e) => {
+        const inputBuffer = e.inputBuffer.getChannelData(0);
+        
+        // Convert Float32Array to 16-bit PCM (Int16Array)
+        const pcmData = new Int16Array(inputBuffer.length);
+        for (let i = 0; i < inputBuffer.length; i++) {
+          const s = Math.max(-1, Math.min(1, inputBuffer[i]));
+          pcmData[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+        }
+
+        // Send raw PCM binary data over WebSocket
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(pcmData.buffer);
+        }
+      };
+
+      source.connect(processor);
+      processor.connect(ctx.destination);
+    } catch (e) {
+      console.error('Failed to start audio streaming:', e);
+    }
+  };
+
+  const stopAudioStreaming = () => {
+    if (processorNodeRef.current) {
+      try {
+        processorNodeRef.current.disconnect();
+      } catch (e) {}
+      processorNodeRef.current.onaudioprocess = null;
+      processorNodeRef.current = null;
+    }
+    if (audioInputRef.current) {
+      try {
+        audioInputRef.current.disconnect();
+      } catch (e) {}
+      audioInputRef.current = null;
+    }
+    if (currentAudioSourceRef.current) {
+      try {
+        currentAudioSourceRef.current.stop();
+      } catch (e) {}
+      currentAudioSourceRef.current = null;
+    }
+    mediaStreamRef.current = null;
+  };
 
   const handleStartInterview = async (resume: string, jobDescription: string) => {
     setIsLoading(true);
@@ -28,7 +100,7 @@ export default function Interview() {
 
       // Initialize audio context
       if (!audioContextRef.current) {
-        audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)();
+        audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
       }
 
       // Connect WebSocket
@@ -38,6 +110,11 @@ export default function Interview() {
       ws.onopen = () => {
         // Send interview ID to backend
         ws.send(JSON.stringify({ interview_id: newInterviewId }));
+        
+        // Start streaming if the stream is already ready
+        if (mediaStreamRef.current) {
+          startAudioStreaming(mediaStreamRef.current);
+        }
       };
 
       ws.onmessage = (event) => {
@@ -46,16 +123,23 @@ export default function Interview() {
 
           if (data.type === 'processing') {
             if (data.transcript) {
-              setTranscript((prev) => {
-                // Update transcript dynamically
-                return data.transcript;
-              });
+              setTranscript(data.transcript);
             }
           }
 
           if (data.type === 'audio') {
             // Play AI audio response
             playAudio(data.audio);
+          }
+
+          if (data.type === 'interruption') {
+            // Stop playing audio when candidate interrupts
+            if (currentAudioSourceRef.current) {
+              try {
+                currentAudioSourceRef.current.stop();
+              } catch (e) {}
+              currentAudioSourceRef.current = null;
+            }
           }
         } catch (e) {
           console.error('Message parse error:', e);
@@ -86,6 +170,7 @@ export default function Interview() {
       // Cleanup on component unmount
       return () => {
         clearInterval(transcriptInterval);
+        stopAudioStreaming();
         if (ws.readyState === WebSocket.OPEN) {
           ws.close();
         }
@@ -108,6 +193,8 @@ export default function Interview() {
         wsRef.current.close();
       }
 
+      stopAudioStreaming();
+
       setInterviewStarted(false);
       setInterviewId(null);
       setTranscript('');
@@ -118,9 +205,51 @@ export default function Interview() {
   };
 
   const playAudio = (audioData: string) => {
-    // Decode and play audio - implementation depends on audio format
-    // This is a placeholder for audio playback logic
-    console.log('Playing audio:', audioData);
+    try {
+      if (!audioContextRef.current) {
+        audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
+      }
+      const ctx = audioContextRef.current;
+      if (ctx.state === 'suspended') {
+        ctx.resume();
+      }
+
+      // Stop any current audio source playing
+      if (currentAudioSourceRef.current) {
+        try {
+          currentAudioSourceRef.current.stop();
+        } catch (e) {}
+        currentAudioSourceRef.current = null;
+      }
+
+      // Decode base64 to binary
+      const binaryString = window.atob(audioData);
+      const len = binaryString.length;
+      const bytes = new Uint8Array(len);
+      for (let i = 0; i < len; i++) {
+        bytes[i] = binaryString.charCodeAt(i);
+      }
+
+      // Convert raw 16-bit PCM bytes to float32
+      const rawInt16 = new Int16Array(bytes.buffer);
+      const float32Data = new Float32Array(rawInt16.length);
+      for (let i = 0; i < rawInt16.length; i++) {
+        float32Data[i] = rawInt16[i] / 32768.0;
+      }
+
+      // Create audio buffer (1 channel, 16000Hz)
+      const audioBuffer = ctx.createBuffer(1, float32Data.length, 16000);
+      audioBuffer.getChannelData(0).set(float32Data);
+
+      // Create source node and play
+      const source = ctx.createBufferSource();
+      source.buffer = audioBuffer;
+      source.connect(ctx.destination);
+      source.start(0);
+      currentAudioSourceRef.current = source;
+    } catch (err) {
+      console.error('Error playing audio:', err);
+    }
   };
 
   const handleVideoError = (errorMsg: string) => {
@@ -176,6 +305,10 @@ export default function Interview() {
                     <VideoStream
                       isActive={interviewStarted}
                       onError={handleVideoError}
+                      onStreamReady={(stream) => {
+                        mediaStreamRef.current = stream;
+                        startAudioStreaming(stream);
+                      }}
                     />
                   </div>
 

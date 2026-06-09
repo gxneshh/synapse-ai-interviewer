@@ -30,11 +30,12 @@ class InterviewOrchestrator:
         self.ai_speaking = False
         self.candidate_speaking = False
         self.conversation_transcript = []
+        self.opening_audio = b""
 
         # Buffers
         self.audio_buffer = bytearray()
 
-    async def initialize(self) -> str:
+    async def initialize(self) -> bytes:
         """Initialize orchestrator and start interview"""
         try:
             await self.stt.start_streaming()
@@ -48,6 +49,7 @@ class InterviewOrchestrator:
 
             # Convert opening to speech
             audio = await self.tts.synthesize_speech(opening_response)
+            self.opening_audio = audio
 
             return audio
 
@@ -68,10 +70,12 @@ class InterviewOrchestrator:
                 'transcript': str,  # Current transcript
                 'ai_response': bytes,  # AI audio response (if available)
                 'status': str,
+                'is_voice': bool,
+                'interrupted': bool,
             }
         """
         if not self.is_running:
-            return {"transcript": "", "ai_response": b"", "status": "stopped"}
+            return {"transcript": "", "ai_response": b"", "status": "stopped", "is_voice": False, "interrupted": False}
 
         try:
             # 1. Add to audio buffer
@@ -83,23 +87,31 @@ class InterviewOrchestrator:
             # 3. Process VAD
             vad_result = self.vad.process_audio_chunk(audio_chunk)
 
+            interrupted = False
+            # Check for interruption: AI is speaking and user starts talking
+            if self.ai_speaking and vad_result["is_voice"]:
+                await self.handle_interruption()
+                interrupted = True
+
             result = {
                 "transcript": self.stt.get_current_transcript(),
                 "ai_response": b"",
                 "status": "listening",
                 "is_voice": vad_result["is_voice"],
+                "interrupted": interrupted,
             }
 
             # 4. If turn complete (candidate finished speaking)
             if vad_result["turn_complete"] and not self.ai_speaking:
-                await self._handle_turn_complete()
+                ai_audio = await self._handle_turn_complete()
+                result["ai_response"] = ai_audio
                 result["status"] = "processing"
 
             return result
 
         except Exception as e:
             print(f"Audio processing error: {e}")
-            return {"transcript": "", "ai_response": b"", "status": "error"}
+            return {"transcript": "", "ai_response": b"", "status": "error", "is_voice": False, "interrupted": False}
 
     async def _handle_turn_complete(self) -> bytes:
         """
